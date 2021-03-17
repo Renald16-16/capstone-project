@@ -1,0 +1,327 @@
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
+import configparser
+import datetime as dt
+
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import avg, col, lower, substring
+from pyspark.sql import SQLContext
+from pyspark.sql.functions import isnan, when, count, col, udf, dayofmonth, dayofweek, month, year, weekofyear
+from pyspark.sql.functions import monotonically_increasing_id
+from pyspark.sql.types import *
+from pyspark.sql.types import StringType, IntegerType
+
+import plotly.plotly as py
+import plotly.graph_objs as go
+import requests
+requests.packages.urllib3.disable_warnings()
+
+import udf_fn
+
+import importlib
+importlib.reload(udf_fn)
+from udf_fn import clean_missing_data, process_mappings, create_demographics_dimension_table, create_immigration_calendar_dimension,quality_check_has_row
+
+
+# Read in the data here
+config = configparser.ConfigParser()
+config.read('config.cfg')
+
+os.environ['AWS_ACCESS_KEY_ID']=config['AWS']['AWS_ACCESS_KEY_ID']
+os.environ['AWS_SECRET_ACCESS_KEY']=config['AWS']['AWS_SECRET_ACCESS_KEY']
+
+#connection to spark
+#connection to spark
+def create_spark_session():
+    spark = SparkSession.builder.\
+    config("spark.jars.packages","saurfang:spark-sas7bdat:2.0.0-s_2.11").\
+    enableHiveSupport().getOrCreate()
+    return spark
+
+def process_immigration_data(spark,df,input_data,output_data):
+    '''
+        Description: This function is used to process the immigration table
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''
+      
+    df =spark.read.format('com.github.saurfang.sas.spark').load(input_data)
+
+    dim_us_states = process_mappings(spark, 'mappings/i94addrl.txt', output_data, ["state_code", "arival_state"], "us_state", "=")
+
+    df  = df.join(dim_us_states, df.i94addr == dim_us_states.state_code, how='inner')
+
+    df = df.selectExpr('cicid','i94yr as year','i94mon as month','i94cit as imig_country_of_birth_code'
+                       ,'i94res as imig_country_of_res_code','i94port as port_code', 'arrdate as arrival_dt'
+                       ,'i94mode as mode_of_transport','i94addr as arrival_state_code','depdate as departure_dt'
+                       ,'i94bir as immigrant_age','i94visa as visa_code','dtadfile as date','biryear as birth_year'
+                       ,'dtaddto as stay_until_dt','gender','airline','fltno as flight_no','visatype')
+
+    # user defined fuction to convert to datetime format
+    get_datetime = udf(lambda x: (dt.datetime(1960, 1, 1).date() + dt.timedelta(x)).isoformat() if x else None)
+
+    df = df.withColumn("arrival_dt", get_datetime(df.arrival_dt))
+
+    df = df.withColumn("departure_dt", get_datetime(df.departure_dt))
+    
+    # create initial calendar df from arrival date column
+    dim_calendar = df.select(['arrival_dt']).distinct()
+    
+    # expand df by adding other calendar columns
+    dim_calendar = dim_calendar.withColumn('arrival_day', dayofmonth('arrival_dt'))
+    dim_calendar = dim_calendar.withColumn('arrival_week', weekofyear('arrival_dt'))
+    dim_calendar = dim_calendar.withColumn('arrival_month', month('arrival_dt'))
+    dim_calendar = dim_calendar.withColumn('arrival_year', year('arrival_dt'))
+    dim_calendar = dim_calendar.withColumn('arrival_weekday', dayofweek('arrival_dt'))
+
+    # create an id field in calendar df
+    dim_calendar = dim_calendar.withColumn('id', monotonically_increasing_id())
+    
+    # write to s3
+    df.write.partitionBy('year','month').parquet(os.path.join(output_data,'fact_immigration.parquet'),mode="overwrite")
+    
+    records1 = df.count()
+    records2 = dim_us_states.count()
+    print(f"fact immigration table created successfully with {records1} records...")
+    print(f"Dimension US table created successfully with {records2} records...")
+    
+    records3 = dim_calendar.count()
+    print(f"Dimension calendar created successfully with {records3} records...")
+    
+    # Perform more than one row quality check
+    table_dfs = {
+        'fact_immigration': df,
+        'dim_us_states': dim_us_states,
+        'dim_calendar': dim_calendar,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)
+    
+
+def procss_dimension_tables (spark,df,output_data):
+    '''
+        Description: This function is used to process the dimension tables
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''
+    # Read the immigrant country data from the source mapping file
+    df = process_mappings(spark, 'mappings/i94cntyl.txt', output_data, 
+                                  ["country_code", "immigrant_country"], "country", " =  ")
+    
+    # Remove the 'Other' values as they are not valid countries per the lookup database
+    df= df.filter(df.immigrant_country !='Other')
+    
+    records = df.count()
+    print(f"Dimension country code table created successfully with {records} records...")    
+    
+    # Perform more than one row quality check
+    table_dfs = {
+        'dim_country_code': df,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)
+    
+def process_temperature_table (spark,df,input_data,output_data):
+    '''
+        Description: This function is used to process the dimension temperature table
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''
+
+    df = spark.read.csv(input_data, header=True, inferSchema=True)
+    
+    # Read port code file the source mapping file
+    dim_us_port = process_mappings(spark, 'mappings/i94prtl.txt', output_data, ["port_code", "city"], "us_port", "	=	")
+    
+    # convert the City to lowercase for better mapping
+    df = df.withColumn('city_lower', lower(df.City))
+    dim_us_port = dim_us_port.withColumn('city_lower',lower(dim_us_port.city))
+    
+    # drop one city value
+    dim_us_port=dim_us_port.drop('city')
+    
+    # Join the temperature data to port table to remove invalid cities from the temperature table
+    df= df.join(dim_us_port,df.city_lower == dim_us_port.city_lower,how='inner')
+    
+    # extract only the required fields 
+    df=df.selectExpr('dt','AverageTemperature','AverageTemperatureUncertainty','City',
+                                            'Latitude','Longitude','port_code','state')
+    
+    # Only pick temperature information from Oct 2010
+    df= df.filter(df.dt > '2010-01-01')
+    
+    records1 = dim_us_port.count()
+    print(f"Dimension port code table created successfully with {records1} records...")    
+    records2 = df.count()
+    print(f"Dimension temperature table created successfully with {records2} records...") 
+    
+    # Perform more than one row quality check
+    table_dfs = {
+        'dim_us_port': dim_us_port,
+        'dim_city_temperature': df,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)    
+
+def process_visa_table (spark,df,input_data,output_data):
+    '''
+        Description: This function is used to process the dimension visa table
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''
+    
+    df = process_mappings(spark, input_data, output_data, ["visa_code", "visa"], "visa", " = ")
+    
+    records = df.count()
+    print(f"Dimension visa code table created successfully with {records} records...")
+    
+    # Perform more than one row quality check
+    table_dfs = {
+        'dim_visa': df,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)    
+    
+def process_transport_mode_table (spark,df,input_data,output_data):
+    '''
+        Description: This function is used to process the dimension visa table
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''
+    
+    df = process_mappings(spark, input_data, output_data, ["mode_code", "mode"], "mode", " = ")
+    
+    records = df.count()
+    print(f"Dimension transport mode code table created successfully with {records} records...") 
+    
+    # Perform more than one row quality check
+    table_dfs = {
+        'dim_mode_of_transport': df,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)  
+    
+def process_demographics_table (spark,df,input_data):
+    '''
+        Description: This function is used to process the dimension visa table
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''    
+    
+    df = spark.read.csv(input_data, inferSchema=True, header=True, sep=';')
+    
+    df = create_demographics_dimension_table(df)
+    
+    dim_race_us = df.selectExpr('City','Race','Count').dropDuplicates()
+    
+    df = df.selectExpr('City','State','median_age','male_population','female_population',
+                       'total_population','number_of_veterans','foreign_born',
+                       'average_household_size','state_code').dropDuplicates()
+    
+    records = df.count()
+    print(f"Dimension demographics table created successfully with {records} records...") 
+    
+    records1 = dim_race_us.count()
+    print(f"Dimension race table created successfully with {records1} records...") 
+    
+    # Perform more than one row quality check
+    table_dfs = {
+        'dim_demographics': df,
+        'dim_race_us': dim_race_us,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)     
+    
+def process_airport_code_table (spark,df,input_data):
+    '''
+        Description: This function is used to process the dimension visa table
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+        Returns:
+            Spark dataframe
+    '''      
+    
+    df = spark.read.csv(input_data, inferSchema=True, header=True, sep=',')
+    
+    df = df.selectExpr('ident as ID','local_code','type as port_type',
+                                        'name as airport_name','elevation_ft','gps_code').dropDuplicates()
+
+    records = df.count()
+    print(f"Dimension airport code table created successfully with {records} records...") 
+
+    # Perform more than one row quality check
+    table_dfs = {
+        'dim_airport_codes': df,
+    }
+    for table_name, table_df in table_dfs.items():
+            quality_check_has_row(table_df, table_name)       
+
+def main():
+    
+    # Initiate the immigration process load
+    spark = create_spark_session()
+    input_data = '../../data/18-83510-I94-Data-2016/i94_apr16_sub.sas7bdat'
+    output_data =  "s3a://output-ren-capstone/"
+    df= 'fact_immigration'
+    process_immigration_data(spark,df,input_data,output_data)
+    
+    # Initiate the country code table process load
+    df='dim_country_code'    
+    procss_dimension_tables (spark,df,output_data)    
+    
+    # Initiate temperature file load
+    input_data='../../data2/GlobalLandTemperaturesByCity.csv'
+    df='dim_city_temperature'
+    process_temperature_table (spark,df,input_data,output_data)
+    
+    # Initiate visa code load
+    input_data='mappings/I94VISA.txt'
+    df='dim_visa'
+    process_visa_table (spark,df,input_data,output_data)
+    
+    # Initiate transpost mode file load process
+    input_data='mappings/i94model.txt'
+    df='dim_mode_of_transport'
+    process_transport_mode_table (spark,df,input_data,output_data)
+    
+    # Initiate demographics file load process
+    input_data="us-cities-demographics.csv"
+    df = 'dim_demographics'
+    process_demographics_table (spark,df,input_data)
+    
+    # Initiate airport code file load process
+    df='dim_airport_codes'
+    input_data = "data/airport-codes_csv.csv"
+    process_airport_code_table (spark,df,input_data)
+    
+if __name__ == "__main__":
+    main()
