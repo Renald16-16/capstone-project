@@ -1,0 +1,135 @@
+def clean_missing_data(df, drop_columns1,drop_columns2,drop_columns3):
+    """Clean missing data
+    :This function , drops the listed columns and removes the record if all values are missing
+    :return: clean dataframe
+    """
+    total_records = df.count()
+    
+    print(f'Total records in dataframe: {total_records:,}')
+    
+    # EDA has shown these columns to exhibit over 90% missing values, and hence we drop them
+    drop_columns = {drop_columns1,drop_columns2,drop_columns3}
+    df = df.drop(*drop_columns)
+    
+    # drop rows where all elements are missing
+    df = df.dropna(how='all')
+
+    new_total_records = df.count()
+    
+    print(f'Total records after cleaning: {new_total_records:,}')
+    
+    return df
+
+def process_mappings(spark, input_data, output_data, column_names, dimension, separator):
+    '''
+        Description: This function can be used to process the mapping files from the current machine, cleans them
+                     and returns a Spark dataframe.
+        Arguments:
+            spark: SparkSession
+            input_data: location for the input data
+            output_data: location for the output data
+            column_names: name of the columns that will be used for the dataframe schema
+            dimension: name of the dimension
+            separator: separator to be used when reading the input data
+        Returns:
+            Spark dataframe
+    '''
+    import pandas as pd
+    
+    dirpath = output_data + dimension
+    
+    df = pd.read_csv(input_data, sep=separator, header=None, engine='python',  names = column_names, skipinitialspace = True) 
+    
+    # remove single quotes from the column at index 1
+    df.iloc[ : , 1 ] = df.iloc[ : , 1 ].str.replace("'", "")
+    
+    # replace invalid codes with Other
+    if(dimension == 'country'):
+        df["immigrant_country"] = df["immigrant_country"].replace(to_replace=["No Country.*", "INVALID.*", "Collapsed.*"], value="Other", regex=True)
+
+    if(dimension == 'us_state'):
+        df.iloc[ : , 0 ] = df.iloc[ : , 0].str.replace("'", "").str.replace("\t", "")
+        
+    if(dimension == 'us_port'):
+        df.iloc[ : , 0 ] = df.iloc[ : , 0].str.replace("'", "")
+        # splitting city and state by ", " from the city column
+        new = df["city"].str.split(", ", n = 1, expand = True) 
+        # making separate state column from new data frame 
+        df["state"]= new[1].str.strip()
+        # replacing the value of city column from new data frame 
+        df["city"]= new[0] 
+    
+    # convert pandas dataframe to spark dataframe
+    df_spark = spark.createDataFrame(df)
+    
+    return df_spark
+
+def transform_immigration(immigration):
+    """
+    Transform immigration dataset.
+    Calculate and add date fields related to arrival to be later used in partitioning.
+    Args:
+        immigration (:obj:`SparkDataFrame`): Spark dataframe to be processed.
+    Returns:
+        immigration (:obj:`SparkDataFrame`): Processed Spark dataframe
+    """
+
+    immigration = immigration \
+        .withColumn("arrdate_tmp", split(col("arrival_dt"), "-")) \
+        .withColumn("arrival_year", col("arrdate_tmp")[0]) \
+        .withColumn("arrival_month", col("arrdate_tmp")[1]) \
+        .withColumn("arrival_day", col("arrdate_tmp")[2]) \
+        .drop("arrdate_tmp")
+
+    return immigration
+
+
+def create_demographics_dimension_table(df):
+    """This function creates a us demographics dimension table from the us cities demographics data.
+    
+    :param df: spark dataframe of us demographics survey data
+    :param output_data: path to write dimension dataframe to
+    :return: spark dataframe representing demographics dimension
+    """
+
+    dim_df = df.withColumnRenamed('Median Age','median_age') \
+            .withColumnRenamed('Male Population', 'male_population') \
+            .withColumnRenamed('Female Population', 'female_population') \
+            .withColumnRenamed('Total Population', 'total_population') \
+            .withColumnRenamed('Number of Veterans', 'number_of_veterans') \
+            .withColumnRenamed('Foreign-born', 'foreign_born') \
+            .withColumnRenamed('Average Household Size', 'average_household_size') \
+            .withColumnRenamed('State Code', 'state_code')
+    
+    return dim_df
+
+
+def create_immigration_calendar_dimension(df):
+    """This function creates an immigration calendar based on arrival date
+    
+    :param df: spark dataframe of immigration events
+    :param output_data: path to write dimension dataframe to
+    :return: spark dataframe representing calendar dimension
+    """
+    import datetime as dt
+    
+    from datetime import datetime, timedelta
+    from pyspark.sql.functions import udf, dayofmonth, dayofweek, month, year, weekofyear, monotonically_increasing_id
+    
+    # create a udf to convert arrival date in SAS format to datetime object
+    get_datetime = udf(lambda x: (dt.datetime(1960, 1, 1).date() + dt.timedelta(x)).isoformat() if x else None)
+    
+    # create initial calendar df from arrdate column
+    calendar_df = df.select(['arrival_dt']).withColumn("arrival_dt", get_datetime(df.arrival_dt)).distinct()
+    
+    # expand df by adding other calendar columns
+    calendar_df = calendar_df.withColumn('arrival_day', dayofmonth('arrival_dt'))
+    calendar_df = calendar_df.withColumn('arrival_week', weekofyear('arrival_dt'))
+    calendar_df = calendar_df.withColumn('arrival_month', month('arrival_dt'))
+    calendar_df = calendar_df.withColumn('arrival_year', year('arrival_dt'))
+    calendar_df = calendar_df.withColumn('arrival_weekday', dayofweek('arrival_dt'))
+
+    # create an id field in calendar df
+    calendar_df = calendar_df.withColumn('id', monotonically_increasing_id())
+    
+    return calendar_df
